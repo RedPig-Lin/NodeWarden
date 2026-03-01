@@ -3,6 +3,7 @@ import { StorageService } from '../services/storage';
 import { errorResponse } from '../utils/response';
 import { generateUUID } from '../utils/uuid';
 import { LIMITS } from '../config/limits';
+import { normalizeCipherLoginForCompatibility } from './ciphers';
 
 // Bitwarden client import request format
 interface CiphersImportRequest {
@@ -100,6 +101,10 @@ export async function handleCiphersImport(request: Request, env: Env, userId: st
   const folders = importData.folders || [];
   const ciphers = importData.ciphers || [];
   const folderRelationships = importData.folderRelationships || [];
+
+  if (folders.length + ciphers.length > LIMITS.performance.importItemLimit) {
+    return errorResponse(`Import exceeds maximum of ${LIMITS.performance.importItemLimit} items`, 400);
+  }
 
   const now = new Date().toISOString();
   const batchChunkSize = LIMITS.performance.bulkMoveChunkSize;
@@ -221,6 +226,7 @@ export async function handleCiphersImport(request: Request, env: Env, userId: st
       updatedAt: now,
       deletedAt: null,
     };
+    cipher.login = normalizeCipherLoginForCompatibility(cipher.login);
 
     cipherRows.push(cipher);
   }

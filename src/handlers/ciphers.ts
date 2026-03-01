@@ -5,13 +5,49 @@ import { generateUUID } from '../utils/uuid';
 import { deleteAllAttachmentsForCipher } from './attachments';
 import { parsePagination, encodeContinuationToken } from '../utils/pagination';
 
+function getAliasedProp(source: any, aliases: string[]): { present: boolean; value: any } {
+  if (!source || typeof source !== 'object') return { present: false, value: undefined };
+  for (const key of aliases) {
+    if (Object.prototype.hasOwnProperty.call(source, key)) {
+      return { present: true, value: source[key] };
+    }
+  }
+  return { present: false, value: undefined };
+}
+
+// Android 2026.2.0 expects fido2Credentials[].counter to be a string.
+export function normalizeCipherLoginForCompatibility(login: any): any {
+  if (!login || typeof login !== 'object') return login ?? null;
+
+  const fido2 = Array.isArray(login.fido2Credentials)
+    ? login.fido2Credentials.map((cred: any) => {
+        if (!cred || typeof cred !== 'object') return cred;
+        const rawCounter = cred.counter;
+        const counter =
+          rawCounter === null || rawCounter === undefined
+            ? '0'
+            : String(rawCounter);
+        return {
+          ...cred,
+          counter,
+        };
+      })
+    : login.fido2Credentials;
+
+  return {
+    ...login,
+    fido2Credentials: fido2,
+  };
+}
+
 // Format attachments for API response
 export function formatAttachments(attachments: Attachment[]): any[] | null {
   if (attachments.length === 0) return null;
   return attachments.map(a => ({
     id: a.id,
     fileName: a.fileName,
-    size: Number(a.size) || 0,  // Android expects Int, not String
+    // Bitwarden clients decode attachment size as string in cipher payloads.
+    size: String(Number(a.size) || 0),
     sizeName: a.sizeName,
     key: a.key,
     url: `/api/ciphers/${a.cipherId}/attachment/${a.id}`,  // Android requires non-null url!
@@ -26,6 +62,7 @@ export function formatAttachments(attachments: Attachment[]): any[] | null {
 export function cipherToResponse(cipher: Cipher, attachments: Attachment[] = []): CipherResponse {
   // Strip internal-only fields that must not appear in the API response
   const { userId, createdAt, updatedAt, deletedAt, ...passthrough } = cipher;
+  const normalizedLogin = normalizeCipherLoginForCompatibility((passthrough as any).login ?? null);
 
   return {
     // Pass through ALL stored cipher fields (known + unknown)
@@ -47,6 +84,7 @@ export function cipherToResponse(cipher: Cipher, attachments: Attachment[] = [])
     object: 'cipher',
     collectionIds: [],
     attachments: formatAttachments(attachments),
+    login: normalizedLogin,
     encryptedFor: null,
   };
 }
@@ -106,6 +144,12 @@ export async function handleGetCipher(request: Request, env: Env, userId: string
   return jsonResponse(cipherToResponse(cipher, attachments));
 }
 
+async function verifyFolderOwnership(storage: StorageService, folderId: string | null | undefined, userId: string): Promise<boolean> {
+  if (!folderId) return true;
+  const folder = await storage.getFolder(folderId);
+  return !!(folder && folder.userId === userId);
+}
+
 // POST /api/ciphers
 export async function handleCreateCipher(request: Request, env: Env, userId: string): Promise<Response> {
   const storage = new StorageService(env.DB);
@@ -136,6 +180,15 @@ export async function handleCreateCipher(request: Request, env: Env, userId: str
     updatedAt: now,
     deletedAt: null,
   };
+  cipher.login = normalizeCipherLoginForCompatibility(cipher.login);
+  const createFields = getAliasedProp(cipherData, ['fields', 'Fields']);
+  cipher.fields = createFields.present ? (createFields.value ?? null) : (cipher.fields ?? null);
+
+  // Prevent referencing a folder owned by another user.
+  if (cipher.folderId) {
+    const folderOk = await verifyFolderOwnership(storage, cipher.folderId, userId);
+    if (!folderOk) return errorResponse('Folder not found', 404);
+  }
 
   await storage.saveCipher(cipher);
   await storage.updateRevisionDate(userId);
@@ -178,6 +231,24 @@ export async function handleUpdateCipher(request: Request, env: Env, userId: str
     updatedAt: new Date().toISOString(),
     deletedAt: existingCipher.deletedAt,
   };
+  cipher.login = normalizeCipherLoginForCompatibility(cipher.login);
+
+  // Custom fields deletion compatibility:
+  // - Accept both camelCase "fields" and PascalCase "Fields".
+  // - For full update (PUT/POST on this endpoint), missing fields means cleared fields.
+  //   This prevents stale custom fields from being resurrected by merge fallback.
+  const incomingFields = getAliasedProp(cipherData, ['fields', 'Fields']);
+  if (incomingFields.present) {
+    cipher.fields = incomingFields.value ?? null;
+  } else if (request.method === 'PUT' || request.method === 'POST') {
+    cipher.fields = null;
+  }
+
+  // Prevent referencing a folder owned by another user.
+  if (cipher.folderId) {
+    const folderOk = await verifyFolderOwnership(storage, cipher.folderId, userId);
+    if (!folderOk) return errorResponse('Folder not found', 404);
+  }
 
   await storage.saveCipher(cipher);
   await storage.updateRevisionDate(userId);
@@ -201,6 +272,29 @@ export async function handleDeleteCipher(request: Request, env: Env, userId: str
   await storage.updateRevisionDate(userId);
 
   return jsonResponse(cipherToResponse(cipher));
+}
+
+// DELETE /api/ciphers/:id (compat mode)
+// Bitwarden clients may call DELETE on a trashed item to purge it permanently.
+// For compatibility:
+// - If item is active -> soft delete.
+// - If item is already soft-deleted -> hard delete.
+export async function handleDeleteCipherCompat(request: Request, env: Env, userId: string, id: string): Promise<Response> {
+  const storage = new StorageService(env.DB);
+  const cipher = await storage.getCipher(id);
+
+  if (!cipher || cipher.userId !== userId) {
+    return errorResponse('Cipher not found', 404);
+  }
+
+  if (cipher.deletedAt) {
+    await deleteAllAttachmentsForCipher(env, id);
+    await storage.deleteCipher(id, userId);
+    await storage.updateRevisionDate(userId);
+    return new Response(null, { status: 204 });
+  }
+
+  return handleDeleteCipher(request, env, userId, id);
 }
 
 // DELETE /api/ciphers/:id (permanent)
@@ -255,6 +349,10 @@ export async function handlePartialUpdateCipher(request: Request, env: Env, user
   }
 
   if (body.folderId !== undefined) {
+    if (body.folderId) {
+      const folderOk = await verifyFolderOwnership(storage, body.folderId, userId);
+      if (!folderOk) return errorResponse('Folder not found', 404);
+    }
     cipher.folderId = body.folderId;
   }
   if (body.favorite !== undefined) {
@@ -281,6 +379,11 @@ export async function handleBulkMoveCiphers(request: Request, env: Env, userId: 
 
   if (!body.ids || !Array.isArray(body.ids)) {
     return errorResponse('ids array is required', 400);
+  }
+
+  if (body.folderId) {
+    const folderOk = await verifyFolderOwnership(storage, body.folderId, userId);
+    if (!folderOk) return errorResponse('Folder not found', 404);
   }
 
   await storage.bulkMoveCiphers(body.ids, body.folderId || null, userId);

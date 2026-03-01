@@ -198,7 +198,7 @@ export async function handleGetAttachment(
     url: downloadUrl,
     fileName: attachment.fileName,
     key: attachment.key,
-    size: Number(attachment.size) || 0,
+    size: String(Number(attachment.size) || 0),
     sizeName: attachment.sizeName,
   });
 }
