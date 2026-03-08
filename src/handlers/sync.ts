@@ -4,7 +4,11 @@ import { errorResponse } from '../utils/response';
 import { cipherToResponse } from './ciphers';
 import { sendToResponse } from './sends';
 import { LIMITS } from '../config/limits';
-import { isTotpEnabled } from '../utils/totp';
+import {
+  buildAccountKeys,
+  buildUserDecryptionCompat,
+  buildUserDecryptionOptions,
+} from '../utils/user-decryption';
 
 interface SyncCacheEntry {
   body: string;
@@ -44,6 +48,12 @@ export async function handleSync(request: Request, env: Env, userId: string): Pr
   const url = new URL(request.url);
   const excludeDomainsParam = url.searchParams.get('excludeDomains');
   const excludeDomains = excludeDomainsParam !== null && /^(1|true|yes)$/i.test(excludeDomainsParam);
+  const userAgent = String(request.headers.get('user-agent') || '').toLowerCase();
+  const omitFido2Credentials =
+    userAgent.includes('android') ||
+    userAgent.includes('iphone') ||
+    userAgent.includes('ipad') ||
+    userAgent.includes('ios');
   
   const user = await storage.getUserById(userId);
   if (!user) {
@@ -76,10 +86,10 @@ export async function handleSync(request: Request, env: Env, userId: string): Pr
     usesKeyConnector: false,
     masterPasswordHint: null,
     culture: 'en-US',
-    twoFactorEnabled: !!user.totpSecret || isTotpEnabled(env.TOTP_SECRET),
+    twoFactorEnabled: !!user.totpSecret,
     key: user.key,
     privateKey: user.privateKey,
-    accountKeys: null,
+    accountKeys: buildAccountKeys(user),
     securityStamp: user.securityStamp || user.id,
     organizations: [],
     providers: [],
@@ -94,7 +104,7 @@ export async function handleSync(request: Request, env: Env, userId: string): Pr
   const cipherResponses: CipherResponse[] = [];
   for (const cipher of ciphers) {
     const attachments = attachmentsByCipher.get(cipher.id) || [];
-    cipherResponses.push(cipherToResponse(cipher, attachments));
+    cipherResponses.push(cipherToResponse(cipher, attachments, { omitFido2Credentials }));
   }
 
   // Build folder responses
@@ -120,36 +130,9 @@ export async function handleSync(request: Request, env: Env, userId: string): Pr
     policies: [],
     sends: sends.map(sendToResponse),
     // PascalCase for desktop/browser clients
-    UserDecryptionOptions: {
-      HasMasterPassword: true,
-      Object: 'userDecryptionOptions',
-      MasterPasswordUnlock: {
-        Kdf: {
-          KdfType: user.kdfType,
-          Iterations: user.kdfIterations,
-          Memory: user.kdfMemory || null,
-          Parallelism: user.kdfParallelism || null,
-        },
-        MasterKeyEncryptedUserKey: user.key,
-        MasterKeyWrappedUserKey: user.key,
-        Salt: user.email.toLowerCase(),
-        Object: 'masterPasswordUnlock',
-      },
-    },
+    UserDecryptionOptions: buildUserDecryptionOptions(user),
     // camelCase for Android client (SyncResponseJson uses @SerialName("userDecryption"))
-    userDecryption: {
-      masterPasswordUnlock: {
-        kdf: {
-          kdfType: user.kdfType,
-          iterations: user.kdfIterations,
-          memory: user.kdfMemory || null,
-          parallelism: user.kdfParallelism || null,
-        },
-        masterKeyWrappedUserKey: user.key,
-        masterKeyEncryptedUserKey: user.key,
-        salt: user.email.toLowerCase(),
-      },
-    },
+    userDecryption: buildUserDecryptionCompat(user) as SyncResponse['userDecryption'],
     object: 'sync',
   };
 

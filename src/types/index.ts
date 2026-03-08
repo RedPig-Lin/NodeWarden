@@ -1,7 +1,10 @@
 // Environment bindings
 export interface Env {
   DB: D1Database;
-  ATTACHMENTS: R2Bucket;
+  // Prefer R2 when available. Optional to support KV-only deployments.
+  ATTACHMENTS?: R2Bucket;
+  // Optional fallback for attachment/send file storage (no credit card required).
+  ATTACHMENTS_KV?: KVNamespace;
   JWT_SECRET: string;
   TOTP_SECRET?: string;
 }
@@ -281,6 +284,8 @@ export interface UserDecryptionOptions {
   Object: string;
   // Bitwarden Android 2026.1.x expects this to exist; missing it breaks unlock when the vault is empty.
   MasterPasswordUnlock: MasterPasswordUnlock;
+  TrustedDeviceOption: null;
+  KeyConnectorOption: null;
 }
 
 // API Response types
@@ -300,7 +305,14 @@ export interface TokenResponse {
   ResetMasterPassword: boolean;
   scope: string;
   unofficialServer: boolean;
+  MasterPasswordPolicy?: {
+    Object: string;
+  } | null;
+  ApiUseKeyConnector?: boolean;
+  AccountKeys?: any | null;
+  accountKeys?: any | null;
   UserDecryptionOptions: UserDecryptionOptions;
+  userDecryptionOptions?: UserDecryptionOptions;
 }
 
 export interface ProfileResponse {
